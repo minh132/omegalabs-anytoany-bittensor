@@ -49,9 +49,9 @@ async def main(config):
     bt.logging.info(f"Uploading model to Hugging Face: {repo_namespace}/{repo_name}")
 
     # Upload the model
-    await remote_model_store.upload_model(
-        model_dir=config.model_dir,
-        repo_id=config.hf_repo_id
+    commit_info = await remote_model_store.upload_model(
+        repo_id=config.hf_repo_id,
+        local_repo_path=config.model_dir
     )
 
     # Set repository visibility to public
@@ -60,7 +60,7 @@ async def main(config):
             repo_id=config.hf_repo_id,
             private=False  # Không cần thiết lập token vì đã đăng nhập sẵn
         )
-        bt.logging.success(f"Model uploaded and made public at {config.hf_repo_id}")
+        bt.logging.success(f"Model uploaded and made public at {config.hf_repo_id} with commit {commit_info['commit']}")
     except Exception as e:
         bt.logging.error(f"Failed to update repository visibility: {e}")
 
@@ -68,3 +68,4 @@ if __name__ == "__main__":
     # Parse and print configuration
     config = get_config()
     asyncio.run(main(config))
+
