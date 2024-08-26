@@ -1,9 +1,32 @@
+"""A script that pushes a model from disk to the subnet for evaluation.
+
+Usage:
+    python scripts/upload_model.py --load_model_dir <path to model> --hf_repo_id my-username/my-project --wallet.name coldkey --wallet.hotkey hotkey
+
+Prerequisites:
+   1. HF_ACCESS_TOKEN is set in the environment or .env file.
+   2. load_model_dir points to a directory containing a previously trained model, with relevant ckpt file named "checkpoint.pth".
+   3. Your miner is registered
+"""
+
 import asyncio
 import os
 import argparse
+import constants
 from model.storage.hugging_face.hugging_face_model_store import HuggingFaceModelStore, get_required_files, check_config
-from huggingface_hub import update_repo_visibility
+from model.model_updater import ModelUpdater
 import bittensor as bt
+from utilities import utils
+from model.data import Model, ModelId
+from model.storage.chain.chain_model_metadata_store import ChainModelMetadataStore
+from huggingface_hub import update_repo_visibility
+import time
+import hashlib
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
 
 def get_config():
     # Initialize an argument parser
@@ -18,7 +41,7 @@ def get_config():
     parser.add_argument(
         "--model_dir",
         type=str,
-        help="The directory of the model to load.",
+        help="The director of the model to load.",
     )
 
     parser.add_argument(
@@ -27,8 +50,38 @@ def get_config():
         help="The epoch number to load e.g. if you want to upload meta_model_0.pt, epoch should be 0",
     )
 
+    parser.add_argument(
+        "--netuid",
+        type=str,
+        default=constants.SUBNET_UID,
+        help="The subnet UID.",
+    )
+
+    parser.add_argument(
+        "--competition_id",
+        type=str,
+        default=constants.ORIGINAL_COMPETITION_ID,
+        help="competition to mine for (use --list-competitions to get all competitions)",
+    )
+
+    parser.add_argument(
+        "--list_competitions", action="store_true", help="Print out all competitions"
+    )
+
+    # Include wallet and logging arguments from bittensor
+    bt.wallet.add_args(parser)
+    bt.subtensor.add_args(parser)
+
     # Parse the arguments and create a configuration namespace
-    return parser.parse_args()
+    config = bt.config(parser)
+    return config
+
+
+def regenerate_hash(namespace, name, epoch, competition_id):
+    s = " ".join([namespace, name, epoch, competition_id])
+    hash_output = hashlib.sha256(s.encode('utf-8')).hexdigest()
+    return int(hash_output[:16], 16)  # Returns a 64-bit integer from the first 16 hexadecimal characters
+
 
 def validate_repo(ckpt_dir, epoch):
     for filename in get_required_files(epoch):
@@ -37,35 +90,88 @@ def validate_repo(ckpt_dir, epoch):
             raise FileNotFoundError(f"Required file {filepath} not found in {ckpt_dir}")
     check_config(ckpt_dir)
 
-async def main(config):
-    # Get the repo namespace and name
-    repo_namespace, repo_name = config.hf_repo_id.split("/")
 
-    # Validate model directory
-    validate_repo(config.model_dir, config.epoch)
+async def main(config: bt.config):
+    # Create bittensor objects.
+    # bt.logging(config=config)
 
-    # Upload model to Hugging Face
-    remote_model_store = HuggingFaceModelStore()
-    bt.logging.info(f"Uploading model to Hugging Face: {repo_namespace}/{repo_name}")
+    wallet = bt.wallet(config=config)
+    subtensor = bt.subtensor(config=config)
+    # bt.logging.debug("Subtensor network: ", subtensor.network)
+    # metagraph: bt.metagraph = subtensor.metagraph(config.netuid)
 
-    # Upload the model
-    commit_info = await remote_model_store.upload_model(
-        repo_id=config.hf_repo_id,
-        local_repo_path=config.model_dir
+    # Make sure we're registered and have a HuggingFace token.
+    # utils.assert_registered(wallet, metagraph)
+
+    # Get current model parameters
+    parameters = ModelUpdater.get_competition_parameters(config.competition_id)
+    if parameters is None:
+        raise RuntimeError(
+            f"Could not get competition parameters for block {config.competition_id}"
+        )
+
+    repo_namespace, repo_name = utils.validate_hf_repo_id(config.hf_repo_id)
+    model_id = ModelId(
+        namespace=repo_namespace,
+        name=repo_name,
+        epoch=config.epoch,
+        competition_id=config.competition_id,
     )
 
-    # Set repository visibility to public
-    try:
-        update_repo_visibility(
-            repo_id=config.hf_repo_id,
-            private=False  # Không cần thiết lập token vì đã đăng nhập sẵn
-        )
-        bt.logging.success(f"Model uploaded and made public at {config.hf_repo_id} with commit {commit_info['commit']}")
-    except Exception as e:
-        bt.logging.error(f"Failed to update repository visibility: {e}")
+    model = Model(id=model_id, local_repo_dir=config.model_dir)
+
+    validate_repo(config.model_dir, config.epoch)
+
+    remote_model_store = HuggingFaceModelStore()
+
+    bt.logging.info(f"Uploading model to Hugging Face with id {model_id}")
+
+    model_id_with_commit = await remote_model_store.upload_model(
+        model=model,
+        competition_parameters=parameters,
+    )
+
+    model_id_with_hash = ModelId(
+        namespace=repo_namespace,
+        name=repo_name,
+        epoch=config.epoch, 
+        hash=regenerate_hash(repo_namespace, repo_name, config.epoch, config.competition_id),
+        commit=model_id_with_commit.commit,
+        competition_id=config.competition_id,
+    )
+    
+    bt.logging.info(
+        f"Model uploaded to Hugging Face with commit {model_id_with_hash.commit} and hash {model_id_with_hash.hash}"
+    )
+
+    # model_metadata_store = ChainModelMetadataStore(
+    #     subtensor=subtensor, wallet=wallet, subnet_uid=config.netuid
+    # )
+
+    # We can only commit to the chain every n minutes, so run this in a loop, until successful.
+    while True:
+        try:
+            update_repo_visibility(
+                model_id.namespace + "/" + model_id.name,
+                private=False,
+                token=os.getenv("HF_ACCESS_TOKEN"),
+            )
+            # await model_metadata_store.store_model_metadata(
+            #     wallet.hotkey.ss58_address, model_id_with_hash
+            # )
+            bt.logging.success("Committed model ")
+            break
+        except Exception as e:
+            bt.logging.error(f"Failed to advertise model on the chain: {e}")
+            bt.logging.error("Retrying in 120 seconds...")
+            time.sleep(120)
+
 
 if __name__ == "__main__":
     # Parse and print configuration
     config = get_config()
-    asyncio.run(main(config))
-
+    if config.list_competitions:
+        bt.logging.info(constants.COMPETITION_SCHEDULE)
+    else:
+        # bt.logging.info(config)
+        asyncio.run(main(config))
